@@ -60,6 +60,15 @@ _derive_bound 求 t(乙) − t(甲) 的最紧下界/上界（推不出的端点�
 零撤回方案。否则按撤回行数 k=1,2,… 递增枚举 C(n,k) 个原始行号组合，第一个存在可行
 剩余子集的 k 即最少撤回数，返回该层全部可行组合（每个方案附剩余约束的一条规范化
 可行时间线，撤回全部行时时间线为空）；语法错误逐行返回。
+
+行程可达性核对（solve_itinerary）：在区间文本之外，用户逐行填写事件地点
+（事件,地点）、有向通行路段（起点,终点,分钟，非负整数）与按发生顺序排列的行程事件
+（每行一个事件名）。对每对相邻行程事件，在地点网络中求其地点间的最短通行时间
+（Dijkstra；同地点按 0 分钟），作为通行下界 t(后一事件) − t(前一事件) ≥ 最短分钟，
+与区间行的上下界边复用同一套差分约束 Bellman-Ford 联立。某段地点间无路可达时直接
+指出对应事件段；联立出负环（时间冲突）时，闭合矛盾链同时含原区间行号与行程段，
+行程段附其最短路线；可行时返回各段最短路线、所需分钟与一条满足全部约束的时间线
+（最早事件为第 0 分钟）。校验：重复事件地点、缺失事件地点、重复行程事件、负通行时间。
 """
 
 from __future__ import annotations
@@ -67,6 +76,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from heapq import heappop, heappush
 from itertools import combinations, product
 
 _INT_RE = re.compile(r"^[+-]?\d+$")
@@ -101,10 +111,10 @@ class Edge:
     v: int
     w: int
     line: int
-    kind: str  # "upper"（上界边）、"lower"（下界边）或 "anchor"（锚点等式边）
-    bound: int  # 原始行中的界值（上界为 high，下界为 low；锚点边为相对零点的分钟数）
-    source: str = "interval"  # "interval"（区间行）或 "anchor"（锚点行）
-    label: str = ""  # 锚点边展示用的日期时刻文本（YYYY-MM-DD HH:MM）
+    kind: str  # "upper"（上界边）、"lower"（下界边）、"anchor"（锚点等式边）或 "travel"（行程通行下界边）
+    bound: int  # 原始行中的界值（上界为 high，下界为 low；锚点边为相对零点的分钟数；行程边为最短通行分钟）
+    source: str = "interval"  # "interval"（区间行）、"anchor"（锚点行）或 "travel"（行程段）
+    label: str = ""  # 锚点边展示用日期时刻（YYYY-MM-DD HH:MM）；行程边展示用最短路线的地点文本
 
 
 @dataclass(frozen=True)
@@ -220,6 +230,21 @@ def _edge_step(names: list[str], e: Edge) -> dict:
     if e.kind == "upper":
         relation = f"{names[e.v]}−{names[e.u]} ≤ {e.bound}"
         kind_label = "上界（最多）"
+    elif e.kind == "travel":
+        # 行程通行下界边单独返回：source 标为 "travel"，route 为最短路线的地点文本
+        relation = f"{names[e.u]}−{names[e.v]} ≥ {e.bound}（行程第{e.line}段最短通行：{e.label}）"
+        return {
+            "from": _display_name(names[e.u]),
+            "to": _display_name(names[e.v]),
+            "weight": e.w,
+            "line": e.line,
+            "kind": e.kind,
+            "kind_label": "行程通行",
+            "bound": e.bound,
+            "source": "travel",
+            "route": e.label,
+            "relation": relation,
+        }
     else:
         # 边 v -> u、权 -low 对应 names[v]−names[u] >= low，即 u 事件比 v 事件早至少 low
         relation = f"{names[e.u]}−{names[e.v]} ≥ {e.bound}"
@@ -1488,5 +1513,383 @@ def solve_aliases(text: str, aliases_text: str) -> dict:
         "status": "ok",
         "timeline": timeline,
         "differences": differences,
+        **meta,
+    }
+
+
+# ---------- 行程可达性核对 ----------
+
+@dataclass(frozen=True)
+class Place:
+    line: int  # 地点文本的原始行号
+    event: str
+    location: str
+
+
+@dataclass(frozen=True)
+class Route:
+    line: int  # 路段文本的原始行号
+    origin: str
+    dest: str
+    minutes: int
+
+
+def parse_places(text: str) -> tuple[list[Place], list[dict]]:
+    """按行解析事件地点：事件,地点（每个事件只能填写一个地点）。
+
+    返回 (有效地点, 错误列表)；空行跳过但行号保留为地点文本的原始行号。
+    同一事件在多行出现判为重复事件地点（即使地点相同，也属于重复填写）。
+    """
+    errors: list[dict] = []
+    places: list[Place] = []
+
+    if not text or not text.strip():
+        return places, [{"line": None, "message": "地点输入为空：请粘贴“事件,地点”格式的多行文本。"}]
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为原始行号
+
+        # 兼容中文逗号
+        parts = [p.strip() for p in line.replace("，", ",").split(",")]
+        if len(parts) != 2:
+            errors.append({
+                "line": line_no,
+                "message": f"地点第{line_no}行：应为 2 个字段（事件,地点），实际得到 {len(parts)} 个。",
+            })
+            continue
+
+        event, location = parts
+        row_errors: list[str] = []
+        if not event:
+            row_errors.append("事件名为空")
+        if not location:
+            row_errors.append("地点为空")
+        if row_errors:
+            errors.append({"line": line_no, "message": f"地点第{line_no}行：" + "；".join(row_errors) + "。"})
+            continue
+
+        places.append(Place(line_no, event, location))
+
+    # 重复事件地点：同一事件只能对应一个地点
+    lines_by_event: dict[str, list[int]] = {}
+    for p in places:
+        lines_by_event.setdefault(p.event, []).append(p.line)
+    for event, lines in lines_by_event.items():
+        if len(lines) > 1:
+            line_text = "、".join(str(l) for l in lines)
+            errors.append({
+                "line": lines[1],
+                "message": (
+                    f"地点第{lines[1]}行：事件“{event}”的地点重复填写（第{line_text}行）："
+                    "每个事件只能填写一个地点，请合并为一行。"
+                ),
+            })
+
+    return places, errors
+
+
+def parse_routes(text: str) -> tuple[list[Route], list[dict]]:
+    """按行解析有向通行路段：起点,终点,分钟（分钟为非负整数，负通行时间报错）。
+
+    返回 (有效路段, 错误列表)；空行跳过但行号保留为路段文本的原始行号。
+    """
+    errors: list[dict] = []
+    routes: list[Route] = []
+
+    if not text or not text.strip():
+        return routes, [{"line": None, "message": "通行路段输入为空：请粘贴“起点,终点,分钟”格式的多行文本。"}]
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为原始行号
+
+        # 兼容中文逗号
+        parts = [p.strip() for p in line.replace("，", ",").split(",")]
+        if len(parts) != 3:
+            errors.append({
+                "line": line_no,
+                "message": f"路段第{line_no}行：应为 3 个字段（起点,终点,分钟），实际得到 {len(parts)} 个。",
+            })
+            continue
+
+        origin, dest, minutes_s = parts
+        row_errors: list[str] = []
+        if not origin:
+            row_errors.append("起点为空")
+        if not dest:
+            row_errors.append("终点为空")
+        minutes: int | None = None
+        if _INT_RE.match(minutes_s):
+            minutes = int(minutes_s)
+            if minutes < 0:
+                row_errors.append(f"通行时间不能为负，得到 {minutes} 分钟")
+        else:
+            row_errors.append(f"分钟必须是整数分钟，得到 “{minutes_s}”")
+        if row_errors:
+            errors.append({"line": line_no, "message": f"路段第{line_no}行：" + "；".join(row_errors) + "。"})
+            continue
+
+        routes.append(Route(line_no, origin, dest, minutes))  # type: ignore[arg-type]
+
+    return routes, errors
+
+
+def parse_order(text: str) -> tuple[list[tuple[int, str]], list[dict]]:
+    """按行解析行程顺序：每行一个事件名（按发生顺序）。
+
+    返回 ([(原始行号, 事件名)], 错误列表)；空行跳过但行号保留为行程文本的原始行号。
+    同一事件重复出现判为重复行程事件；行程至少需要 2 个事件。
+    """
+    errors: list[dict] = []
+    order: list[tuple[int, str]] = []
+
+    if not text or not text.strip():
+        return order, [{"line": None, "message": "行程输入为空：请按发生顺序每行填写一个事件名。"}]
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为原始行号
+        if "," in line or "，" in line:
+            errors.append({
+                "line": line_no,
+                "message": f"行程第{line_no}行：每行只填写一个事件名（按发生顺序），本行含有逗号。",
+            })
+            continue
+        order.append((line_no, line))
+
+    # 重复行程事件：行程中的每个事件只能出现一次
+    lines_by_event: dict[str, list[int]] = {}
+    for line_no, event in order:
+        lines_by_event.setdefault(event, []).append(line_no)
+    for event, lines in lines_by_event.items():
+        if len(lines) > 1:
+            line_text = "、".join(str(l) for l in lines)
+            errors.append({
+                "line": lines[1],
+                "message": (
+                    f"行程第{lines[1]}行：行程事件“{event}”重复出现（第{line_text}行）："
+                    "行程中的每个事件只能出现一次。"
+                ),
+            })
+
+    if not errors and len(order) < 2:
+        errors.append({
+            "line": None,
+            "message": "行程至少需要 2 个事件（按发生顺序每行一个），才能核对相邻事件之间的通行。",
+        })
+
+    return order, errors
+
+
+def _shortest_route(
+    adj: dict[str, list[Route]], source: str, target: str
+) -> tuple[int | None, list[str], list[Route]]:
+    """地点网络中 source -> target 的最短通行（Dijkstra，路段分钟非负）。
+
+    同地点按 0 分钟处理：地点路径只含该地点、不经过任何路段。
+    返回 (最短分钟, 地点路径, 依次经过的路段)；不可达时分钟为 None、路径与路段为空。
+    """
+    if source == target:
+        return 0, [source], []
+
+    dist: dict[str, int] = {source: 0}
+    prev: dict[str, tuple[str, Route]] = {}
+    heap: list[tuple[int, str]] = [(0, source)]
+    settled: set[str] = set()
+    while heap:
+        d, u = heappop(heap)
+        if u in settled:
+            continue
+        settled.add(u)
+        if u == target:
+            break
+        for r in adj.get(u, []):
+            nd = d + r.minutes
+            old = dist.get(r.dest)
+            if r.dest not in settled and (old is None or nd < old):
+                dist[r.dest] = nd
+                prev[r.dest] = (u, r)
+                heappush(heap, (nd, r.dest))
+
+    if target not in dist:
+        return None, [], []
+
+    path = [target]
+    legs: list[Route] = []
+    cur = target
+    while cur != source:
+        pnode, r = prev[cur]
+        legs.append(r)
+        path.append(pnode)
+        cur = pnode
+    path.reverse()
+    legs.reverse()
+    return dist[target], path, legs
+
+
+def solve_itinerary(text: str, places_text: str, routes_text: str, order_text: str) -> dict:
+    """行程可达性核对：事件地点 + 有向通行路段 + 行程顺序，与页面区间文本联立。
+
+    区间文本沿用现有“事件甲,事件乙,最少分钟,最多分钟”格式（可留空，纯行程通行核对）；
+    地点文本每行“事件,地点”，路段文本每行“起点,终点,分钟”（非负整数），行程文本每行
+    一个事件名（按发生顺序）。校验：重复事件地点、缺失事件地点、重复行程事件、负通行时间。
+
+    对每对相邻行程事件，在地点网络（有向路段）中求其地点间的最短通行时间（Dijkstra；
+    同地点按 0 分钟），作为通行下界 t(后一事件) − t(前一事件) ≥ 最短分钟，与区间行的
+    上下界边复用同一套差分约束 Bellman-Ford 联立：
+
+    - 某段地点间无路可达：直接指出对应事件段（含起点、终点地点），不做时间联立；
+    - 时间冲突：闭合矛盾链同时含原区间行号与行程段，行程段附其最短路线；
+    - 可行：返回各段最短路线、所需分钟，以及一条满足全部约束的时间线（最早事件为第 0 分钟）。
+    """
+    errors: list[dict] = []
+    rows: list[Row] = []
+    if text and text.strip():
+        rows, errors = parse_text(text)  # 区间文本可留空：仅按行程通行下界核对
+    places, place_errors = parse_places(places_text)
+    routes, route_errors = parse_routes(routes_text)
+    order, order_errors = parse_order(order_text)
+    errors = errors + place_errors + route_errors + order_errors
+
+    # 缺失事件地点：行程中的每个事件都必须在地点表中有一个地点
+    # （地点表或行程本身已有错误时不再级联报错）
+    place_of = {p.event: p.location for p in places}
+    if not place_errors and not order_errors:
+        for line_no, event in order:
+            if event not in place_of:
+                errors.append({
+                    "line": line_no,
+                    "message": (
+                        f"行程第{line_no}行：行程事件“{event}”没有填写地点，"
+                        f"请在地点表中补充一行“{event},地点”。"
+                    ),
+                })
+    if errors:
+        return {"status": "error", "errors": errors}
+
+    # 地点网络邻接表（有向；同一起终点的平行路段在最短路中自然取小）
+    adj: dict[str, list[Route]] = {}
+    for r in routes:
+        adj.setdefault(r.origin, []).append(r)
+
+    # 每对相邻行程事件的最短通行（同地点按 0 分钟）
+    segments: list[dict] = []
+    unreachable: list[dict] = []
+    for i in range(len(order) - 1):
+        ev_a, ev_b = order[i][1], order[i + 1][1]
+        la, lb = place_of[ev_a], place_of[ev_b]
+        minutes, path, legs = _shortest_route(adj, la, lb)
+        seg = {
+            "index": i + 1,
+            "from_event": ev_a,
+            "to_event": ev_b,
+            "from_location": la,
+            "to_location": lb,
+            "same_location": la == lb,
+            "minutes": minutes,
+            "route": path,
+            "legs": [
+                {"from": r.origin, "to": r.dest, "minutes": r.minutes, "line": r.line}
+                for r in legs
+            ],
+        }
+        segments.append(seg)
+        if minutes is None:
+            unreachable.append(seg)
+
+    meta = {
+        "order": [ev for _, ev in order],
+        "segment_count": len(segments),
+        "place_count": len(places),
+        "route_count": len(routes),
+        "line_count": len(rows),
+    }
+
+    if unreachable:
+        desc = "；".join(
+            f"第{s['index']}段 {s['from_event']} → {s['to_event']}"
+            f"（{s['from_location']} → {s['to_location']}）"
+            for s in unreachable
+        )
+        return {
+            "status": "unreachable",
+            "message": (
+                f"{len(unreachable)} 个行程段在通行路段网络中无路可达：{desc}。"
+                "请补充相应的有向通行路段（可经中间地点间接到达）后重新核对。"
+            ),
+            "segments": segments,
+            "unreachable": unreachable,
+            **meta,
+        }
+
+    # 联立：区间行的上下界边 + 行程通行下界边（t(后一事件) − t(前一事件) ≥ 最短通行分钟）
+    names, index, edges = _build_graph(rows)
+    for _, ev in order:
+        if ev not in index:
+            index[ev] = len(names)
+            names.append(ev)
+    for seg in segments:
+        m = seg["minutes"]
+        if m is None:
+            continue  # 防御：无路可达已在上方返回
+        u = index[seg["to_event"]]
+        v = index[seg["from_event"]]
+        edges.append(Edge(u, v, -m, seg["index"], "travel", m, "travel", " → ".join(seg["route"])))
+
+    dist, pred, last_relaxed = _relax_all(names, edges)
+    if last_relaxed is not None:
+        # 时间冲突：闭合矛盾链含原区间行号与行程段；行程段步骤附其最短路线
+        result = _conflict_result(names, pred, last_relaxed, len(names))
+        seg_by_index = {s["index"]: s for s in segments}
+        for step in result["conflict"]["steps"]:
+            if step.get("kind") == "travel":
+                seg = seg_by_index.get(step["line"])
+                if seg is not None:
+                    step["segment"] = seg
+        result["segments"] = segments
+        result.update(meta)
+        return result
+
+    # 可行：平移使最早事件落在第 0 分钟（与 solve_rows 同款规范化）
+    base = min(dist)
+    position_of = {ev: i + 1 for i, (_, ev) in enumerate(order)}
+    timeline = [
+        {
+            "event": names[i],
+            "minute": dist[i] - base,
+            "in_itinerary": names[i] in position_of,
+            "position": position_of.get(names[i]),
+        }
+        for i in range(len(names))
+    ]
+    timeline.sort(key=lambda x: (x["minute"], x["event"]))
+
+    for seg in segments:
+        # 本时间线中该段的实际间隔（必然 ≥ 最短通行分钟）
+        seg["actual"] = dist[index[seg["to_event"]]] - dist[index[seg["from_event"]]]
+
+    differences = [
+        {
+            "line": r.line,
+            "a": r.a,
+            "b": r.b,
+            "low": r.low,
+            "high": r.high,
+            "actual": dist[index[r.b]] - dist[index[r.a]],
+        }
+        for r in rows
+    ]
+
+    return {
+        "status": "ok",
+        "segments": segments,
+        "travel_total": sum(s["minutes"] for s in segments),  # type: ignore[misc]
+        "timeline": timeline,
+        "differences": differences,
+        "event_count": len(names),
         **meta,
     }

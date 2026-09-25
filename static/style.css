@@ -136,6 +136,7 @@ td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
 .tag.upper { background: #e6eef9; color: #2b5d8a; }
 .tag.lower { background: #f3e8f2; color: #7a3570; }
 .tag.anchor { background: #e3f2ef; color: #1f6f5f; }
+.tag.travel { background: #fbf1e4; color: var(--warn); }
 
 /* 绝对时间锚定：事件定位状态 */
 .tag.exact { background: var(--ok-bg); color: var(--ok); }
@@ -311,3 +312,15 @@ tr.combo-conflict td { color: var(--muted); }
   color: var(--warn);
 }
 .withdraw-conflict summary:hover { color: #75491f; }
+
+/* 行程可达性核对 */
+.itinerary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+@media (max-width: 640px) {
+  .itinerary-grid { grid-template-columns: 1fr; }
+}
+.itinerary-grid > div label { font-size: 14px; margin-bottom: 6px; }
+.itinerary-seg-card h3 { word-break: break-all; }

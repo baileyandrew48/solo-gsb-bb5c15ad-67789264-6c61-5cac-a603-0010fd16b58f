@@ -1,7 +1,7 @@
 """FastAPI 入口：提供静态页面与 /api/solve 联立求解、/api/redundancy 约束冗余核对、
 /api/compare 两版比较、/api/repair 冲突单行修订建议、/api/anchor 绝对时间锚定、
 /api/precedence 互斥说法下的先后查询、/api/withdrawals 最少撤回、
-/api/aliases 事件别名归并核对接口。"""
+/api/aliases 事件别名归并核对、/api/itinerary 行程可达性核对接口。"""
 
 from __future__ import annotations
 
@@ -17,11 +17,12 @@ from .solver import (
     solve,
     solve_aliases,
     solve_anchored,
+    solve_itinerary,
     solve_precedence,
     suggest_repairs,
 )
 
-app = FastAPI(title="口述史事件时间线核对", version="1.7.0")
+app = FastAPI(title="口述史事件时间线核对", version="1.8.0")
 
 
 class SolveRequest(BaseModel):
@@ -53,6 +54,13 @@ class PrecedenceRequest(BaseModel):
 class AliasRequest(BaseModel):
     text: str = ""
     aliases: str = ""
+
+
+class ItineraryRequest(BaseModel):
+    text: str = ""
+    places: str = ""
+    routes: str = ""
+    order: str = ""
 
 
 @app.get("/api/health")
@@ -109,6 +117,14 @@ def api_aliases(req: AliasRequest) -> dict:
     # 同组内区间也参与判定，冲突时返回保留原始区间行号与别名组的矛盾说明，
     # 可解时返回按统一事件归并的时间线及每组原名称
     return solve_aliases(req.text or "", req.aliases or "")
+
+
+@app.post("/api/itinerary")
+def api_itinerary(req: ItineraryRequest) -> dict:
+    # 行程可达性核对：地点（事件,地点）、有向路段（起点,终点,分钟，非负）与行程顺序
+    # （每行一个事件名）与页面区间文本联立；无路可达指出对应事件段，时间冲突给出含
+    # 原区间行号、事件段及其最短路线的矛盾依据，可行时给出各段最短路线与一条可行时间线
+    return solve_itinerary(req.text or "", req.places or "", req.routes or "", req.order or "")
 
 
 @app.get("/")

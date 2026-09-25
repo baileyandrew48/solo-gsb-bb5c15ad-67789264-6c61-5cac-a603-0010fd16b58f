@@ -29,6 +29,11 @@
         同一事件被记成多个名字时，还可在区间旁逐行填写<strong>事件别名</strong>（<code>事件名,同一事件的另一名称</code>）做<strong>别名归并核对</strong>：
         后端按传递关系把名称归为同一事件，再用归并后的节点联立原区间（<strong>同组内的区间也参与判定</strong>）；
         归并造成矛盾时给出保留<strong>原始区间行号与别名组</strong>的冲突说明，可解时展示按统一事件归并的时间线及每组原名称。
+        还可在区间之外逐行填写<strong>事件地点</strong>（<code>事件,地点</code>）、<strong>有向通行路段</strong>（<code>起点,终点,分钟</code>）与
+        <strong>行程顺序</strong>（每行一个事件名，按发生顺序）做<strong>行程可达性核对</strong>：
+        后端对每对相邻事件求地点网络中的<strong>最短通行时间</strong>（同地点按 0 分钟）并与上方区间联立——
+        无路可达时指出对应事件段，时间冲突时给出含<strong>原区间行号、事件段及其最短路线</strong>的矛盾依据，
+        可行时列出各段最短路线、所需分钟与一条满足全部约束的时间线。
       </p>
     </header>
 
@@ -187,6 +192,43 @@
     </section>
 
     <section id="withdraw-result" aria-live="polite"></section>
+
+    <section class="input-area">
+      <label><strong>行程可达性核对</strong></label>
+      <p class="muted" style="margin-top:0">
+        在上方“事件区间”文本（可留空）的基础上，逐行填写<strong>事件地点</strong>（<code>事件,地点</code>，每个事件只能填写一个地点）、
+        <strong>有向通行路段</strong>（<code>起点,终点,分钟</code>，分钟为非负整数；路段有方向，反向需另写一行）与
+        <strong>行程顺序</strong>（每行一个事件名，按发生顺序，至少 2 个事件）。后端对每对相邻事件求地点网络中的
+        <strong>最短通行时间</strong>（同地点按 0 分钟），把通行下界与上方区间联立：
+        某段<strong>无路可达</strong>时指出对应事件段；<strong>时间冲突</strong>时给出含
+        <strong>原区间行号、事件段及其最短路线</strong>的闭合矛盾链；可行时列出各段最短路线、所需分钟与一条满足全部约束的时间线。
+        重复事件地点、缺失事件地点、重复行程事件与负通行时间会逐行报错。
+      </p>
+      <div class="itinerary-grid">
+        <div>
+          <label for="places-input">事件地点（每行一条）</label>
+          <textarea id="places-input" rows="6" spellcheck="false"
+            placeholder="出门,家&#10;到车站,车站&#10;到公司,公司&#10;见客户,客户公司"></textarea>
+        </div>
+        <div>
+          <label for="routes-input">通行路段（每行一条）</label>
+          <textarea id="routes-input" rows="6" spellcheck="false"
+            placeholder="家,车站,15&#10;车站,公司,30&#10;公司,客户公司,20&#10;家,公司,50"></textarea>
+        </div>
+      </div>
+      <label for="order-input" style="margin-top:12px">行程顺序（每行一个事件名，按发生顺序）</label>
+      <textarea id="order-input" rows="5" spellcheck="false"
+        placeholder="出门&#10;到车站&#10;到公司&#10;见客户"></textarea>
+      <div class="button-row">
+        <button id="btn-itinerary" class="primary">行程可达性核对</button>
+        <button id="btn-itinerary-example-ok">填入可行示例</button>
+        <button id="btn-itinerary-example-conflict">填入冲突示例</button>
+        <button id="btn-itinerary-example-unreachable">填入无路示例</button>
+        <button id="btn-itinerary-clear" class="ghost">清空行程</button>
+      </div>
+    </section>
+
+    <section id="itinerary-result" aria-live="polite"></section>
 
     <section id="result" aria-live="polite"></section>
   </main>
