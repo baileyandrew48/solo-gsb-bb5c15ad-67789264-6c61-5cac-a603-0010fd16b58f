@@ -60,10 +60,22 @@ _derive_bound 求 t(乙) − t(甲) 的最紧下界/上界（推不出的端点�
 零撤回方案。否则按撤回行数 k=1,2,… 递增枚举 C(n,k) 个原始行号组合，第一个存在可行
 剩余子集的 k 即最少撤回数，返回该层全部可行组合（每个方案附剩余约束的一条规范化
 可行时间线，撤回全部行时时间线为空）；语法错误逐行返回。
+
+行程可达性核对（check_itinerary）：区间文本沿用现有时间差区间（可留空），另有逐行
+“事件,地点”、有向路段“起点,终点,分钟”（非负分钟，重复有向路段取最短）与按发生顺序
+排列的事件名（每行一个、互不相同）。先对四类文本逐行校验（重复事件地点、缺失事件
+地点、重复行程事件、负通行时间等），再对每对相邻行程事件在地点网络上用 Dijkstra 求
+最短通行时间（边权非负；同地点按零分钟）；等距离路线按节点序列字典序与路段行号决胜，
+保证结果确定。无路可达的相邻事件段逐段指出且不联立；可达时把每个
+“后一事件 − 前一事件 ≥ 最短通行分钟”作为通行下界边（b -> a，权 -d）与原区间一起
+跑同一套 Bellman-Ford：负环还原的闭合矛盾链同时含原始区间行号与通行下界环节
+（标注事件段序号、地点对及最短路线）；可行时平移到最早事件为第 0 分钟，给出一条满足
+全部区间与通行下界的时间线，并逐段给出最短路线、所需分钟、实际间隔与富余。
 """
 
 from __future__ import annotations
 
+import heapq
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -101,7 +113,7 @@ class Edge:
     v: int
     w: int
     line: int
-    kind: str  # "upper"（上界边）、"lower"（下界边）或 "anchor"（锚点等式边）
+    kind: str  # "upper"（上界边）、"lower"（下界边）、"anchor"（锚点等式边）或 "travel"（通行下界边）
     bound: int  # 原始行中的界值（上界为 high，下界为 low；锚点边为相对零点的分钟数）
     source: str = "interval"  # "interval"（区间行）或 "anchor"（锚点行）
     label: str = ""  # 锚点边展示用的日期时刻文本（YYYY-MM-DD HH:MM）
@@ -130,6 +142,21 @@ class Alias:
     line: int  # 别名文本的原始行号
     a: str
     b: str
+
+
+@dataclass(frozen=True)
+class PlaceRow:
+    line: int  # 地点文本的原始行号
+    event: str
+    place: str
+
+
+@dataclass(frozen=True)
+class RouteRow:
+    line: int  # 路段文本的原始行号
+    src: str
+    dst: str
+    minutes: int
 
 
 # 互斥说法候选组最多行数：每行二选一，组合数为 2 的幂，限制行数保证枚举耗时可控
@@ -372,8 +399,8 @@ def solve(text: str) -> dict:
     return _format_ok(result) if result["status"] == "ok" else result
 
 
-def _conflict_result(names: list[str], pred, start: int, n: int) -> dict:
-    """从第 N 轮仍被松弛的顶点出发，沿前驱找回负环并还原为原始行构成的矛盾链。"""
+def _extract_cycle_edges(pred, start: int, n: int) -> list[tuple[int, Edge]]:
+    """从第 N 轮仍被松弛的顶点出发，沿前驱找回负环，返回正向（u -> v）的环边序列。"""
     x = start
     for _ in range(n):
         step = pred[x]
@@ -395,8 +422,17 @@ def _conflict_result(names: list[str], pred, start: int, n: int) -> dict:
 
     # 沿前驱收集是逆序的，翻转回边的正向（u -> v）
     cycle_edges.reverse()
+    return cycle_edges
 
-    steps = [_edge_step(names, e) for _, e in cycle_edges]
+
+def _conflict_result(names: list[str], pred, start: int, n: int, step_builder=_edge_step) -> dict:
+    """从前驱链还原负环并转为原始行构成的矛盾链。
+
+    step_builder 决定每条边如何映射为可读步骤（区间/锚点边用 _edge_step，
+    行程可达性核对中含通行下界边时用自定义构建器）。
+    """
+    cycle_edges = _extract_cycle_edges(pred, start, n)
+    steps = [step_builder(names, e) for _, e in cycle_edges]
 
     total = sum(s["weight"] for s in steps)
     return {
@@ -1489,4 +1525,487 @@ def solve_aliases(text: str, aliases_text: str) -> dict:
         "timeline": timeline,
         "differences": differences,
         **meta,
+    }
+
+
+# ---------- 行程可达性核对 ----------
+
+def _split_two(line_no: int, line: str, prefix: str, field_desc: str, errors: list[dict]) -> list[str] | None:
+    """按 2 个字段切分一行（兼容中文逗号）；字段数不对时按原始行号记一条错误。"""
+    parts = [p.strip() for p in line.replace("，", ",").split(",")]
+    if len(parts) != 2:
+        errors.append({
+            "line": line_no,
+            "message": f"{prefix}第{line_no}行：应为 2 个字段（{field_desc}），实际得到 {len(parts)} 个。",
+        })
+        return None
+    return parts
+
+
+def parse_places(text: str) -> tuple[list[PlaceRow], list[dict]]:
+    """按行解析事件地点：事件,地点。
+
+    返回 (有效行, 错误列表)；空行跳过但行号保留为地点文本的原始行号。
+    同一事件重复登记地点（无论地点是否相同）均为错误。
+    """
+    errors: list[dict] = []
+    places: list[PlaceRow] = []
+
+    if not text or not text.strip():
+        return places, [{"line": None, "message": "事件地点输入为空：请逐行粘贴“事件,地点”。"}]
+
+    seen_events: dict[str, int] = {}
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为地点文本的原始行号
+
+        parts = _split_two(line_no, line, "事件地点", "事件,地点", errors)
+        if parts is None:
+            continue
+        event, place = parts
+        if not event or not place:
+            empty = "事件名为空" if not event else "地点为空"
+            errors.append({"line": line_no, "message": f"事件地点第{line_no}行：{empty}。"})
+            continue
+        if event in seen_events:
+            errors.append({
+                "line": line_no,
+                "message": (
+                    f"事件地点第{line_no}行：事件“{event}”重复登记地点"
+                    f"（已在第{seen_events[event]}行登记）；同一事件只能填写一个地点。"
+                ),
+            })
+            continue
+        seen_events[event] = line_no
+        places.append(PlaceRow(line_no, event, place))
+
+    return places, errors
+
+
+def parse_routes(text: str) -> tuple[list[RouteRow], list[dict]]:
+    """按行解析有向通行路段：起点,终点,分钟（分钟为非负整数，0 表示同一地点瞬间可达）。
+
+    返回 (有效行, 错误列表)；空行跳过但行号保留为路段文本的原始行号。
+    同一有向起点→终点重复填写不算错误，求最短时自动取最小值；负通行时间为错误。
+    """
+    errors: list[dict] = []
+    routes: list[RouteRow] = []
+
+    if not text or not text.strip():
+        return routes, [{"line": None, "message": "通行路段输入为空：请逐行粘贴“起点,终点,分钟”。"}]
+
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为路段文本的原始行号
+
+        # 兼容中文逗号
+        parts = [p.strip() for p in line.replace("，", ",").split(",")]
+        if len(parts) != 3:
+            errors.append({
+                "line": line_no,
+                "message": f"通行路段第{line_no}行：应为 3 个字段（起点,终点,分钟），实际得到 {len(parts)} 个。",
+            })
+            continue
+
+        src, dst, minutes_s = parts
+        row_errors: list[str] = []
+        if not src:
+            row_errors.append("起点为空")
+        if not dst:
+            row_errors.append("终点为空")
+        if not _INT_RE.match(minutes_s):
+            row_errors.append(f"通行分钟必须是整数分钟，得到 “{minutes_s}”")
+        if row_errors:
+            errors.append({"line": line_no, "message": f"通行路段第{line_no}行：" + "；".join(row_errors) + "。"})
+            continue
+
+        minutes = int(minutes_s)
+        if minutes < 0:
+            errors.append({
+                "line": line_no,
+                "message": f"通行路段第{line_no}行：通行分钟不能为负数（得到 {minutes}）；时间不能倒流，请检查起点、终点顺序或改为非负分钟。",
+            })
+            continue
+
+        routes.append(RouteRow(line_no, src, dst, minutes))
+
+    return routes, errors
+
+
+def parse_itinerary(text: str) -> tuple[list[str], list[dict]]:
+    """按发生顺序解析行程事件名：每行一个事件；兼容“事件,”之类误填的两字段写法。
+
+    返回 (事件名列表, 错误列表)；空行跳过但行号保留为行程文本的原始行号。
+    同一事件在行程中重复出现为错误（发生顺序应是互不相同的事件序列）。
+    """
+    errors: list[dict] = []
+    events: list[str] = []
+
+    if not text or not text.strip():
+        return events, [{"line": None, "message": "行程顺序输入为空：请按发生顺序逐行填写事件名（每行一个事件）。"}]
+
+    seen: dict[str, int] = {}
+    for line_no, raw in enumerate(text.splitlines(), start=1):
+        line = raw.strip()
+        if not line:
+            continue  # 空行不计入校验，但行号保留为行程文本的原始行号
+
+        # 兼容误写成“事件,”（或“事件，”）的两字段形式：取首个非空字段
+        parts = [p.strip() for p in line.replace("，", ",").split(",")]
+        if len(parts) > 2 or (len(parts) == 2 and parts[1] != ""):
+            errors.append({
+                "line": line_no,
+                "message": f"行程顺序第{line_no}行：每行只填写一个事件名，实际得到 {len(parts)} 个字段（“{line}”）。",
+            })
+            continue
+        name = parts[0]
+        if not name:
+            errors.append({"line": line_no, "message": f"行程顺序第{line_no}行：事件名为空。"})
+            continue
+        if name in seen:
+            errors.append({
+                "line": line_no,
+                "message": (
+                    f"行程顺序第{line_no}行：行程事件“{name}”重复出现"
+                    f"（已在第{seen[name]}行出现）；发生顺序中的事件必须互不相同。"
+                ),
+            })
+            continue
+        seen[name] = line_no
+        events.append(name)
+
+    return events, errors
+
+
+def _route_between(
+    routes: list[RouteRow], src: str, dst: str
+) -> tuple[int | None, list[dict]]:
+    """求地点网络中 src -> dst 的最短通行时间与逐路段路线。
+
+    边权均为非负分钟，使用 Dijkstra；同一起终点的多条有向路段全部保留，
+    最短路自动取最小值。等距离的多条路线按“路径节点序列字典序”决胜，
+    保证同一份输入得到确定且可复核的最短路线。
+
+    返回 (最短分钟, 路段列表)，无路可达时分钟为 None、路段列表为空。
+    每段含路段原始行号、起点、终点与该段分钟。
+    """
+    if src == dst:
+        # 同地点按零分钟处理，不经过任何路段
+        return 0, []
+
+    adj: dict[str, list[tuple[str, int, int]]] = {}
+    for r in routes:
+        adj.setdefault(r.src, []).append((r.dst, r.minutes, r.line))
+
+    # 按“(最短距离, 节点序列字典序)”决胜的 Dijkstra。
+    # 普通 Dijkstra 只对每个顶点维护一个距离；为在等距离路线中选节点序列字典序最小者，
+    # 堆项携带完整路径 (累计分钟, 路径序列)，并对每个顶点单独维护当前最佳的
+    # (距离, 路径)：只有候选严格更优（更短，或等距且序列字典序更小）才入堆。
+    # 决胜只看节点名序列（节点序列相同的平行边在还原阶段再按行号取最小），
+    # 不保证“直达优先”——同距离时第二节点名字典序更小的路线胜出。
+    # 边权非负，顶点第一次被 pop 即为其定稿最优路线。
+    heap: list[tuple[int, tuple[str, ...]]] = [(0, (src,))]
+    # 每个顶点当前最佳的 (距离, 路径)；邻接边只从仍是该顶点最佳的路径展开，
+    # 被更优路线取代的旧路径不再扩展（其下游不可能凭旧前缀变得更优）。
+    best: dict[str, tuple[int, tuple[str, ...]]] = {src: (0, (src,))}
+    done: set[str] = set()
+    while heap:
+        d, path = heapq.heappop(heap)
+        u = path[-1]
+        if u in done:
+            continue
+        if best.get(u) != (d, path):
+            continue  # 已被更优（同距离字典序更小）路线取代的过期堆项
+        done.add(u)
+        if u == dst:
+            break
+        # 邻接边按 (终点名, 分钟, 行号) 排序，使路径字典序比较有稳定依据
+        for v, w, _line in sorted(adj.get(u, ()), key=lambda e: (e[0], e[1], e[2])):
+            cand = d + w
+            cand_path = path + (v,)
+            cand_key = (cand, cand_path)
+            old = best.get(v)
+            if old is None or cand < old[0] or (cand == old[0] and cand_path < old[1]):
+                best[v] = cand_key
+                heapq.heappush(heap, cand_key)
+
+    if dst not in done:
+        return None, []
+
+    # 沿定稿路径逐点对反查路段：该段分钟 = 相邻定稿点最佳距离之差；
+    # 多行平行边中选分钟等于该差值且行号最小的一条。
+    final_path = best[dst][1]
+    segs: list[dict] = []
+    for u, v in zip(final_path, final_path[1:]):
+        w = best[v][0] - best[u][0]
+        line = min(line for (vv, ww, line) in adj[u] if vv == v and ww == w)
+        segs.append({"line": line, "from": u, "to": v, "minutes": w})
+    return best[dst][0], segs
+
+    if dst not in done:
+        return None, []
+
+    # 沿定稿路径逐点对反查路段：该段最短分钟 = 相邻定稿点的最短距离增量；
+    # 多行平行边中选分钟等于该增量且行号最小的一条（与 Dijkstra 选中的边一致）。
+    segs: list[dict] = []
+    for u, v in zip(best_path[dst], best_path[dst][1:]):
+        w = dist[v] - dist[u]
+        matching = sorted(
+            (line for (vv, ww, line) in adj[u] if vv == v and ww == w)
+        )
+        segs.append({"line": matching[0], "from": u, "to": v, "minutes": w})
+    return dist[dst], segs
+
+
+def _travel_step(names: list[str], e: Edge) -> dict:
+    """通行下界边的可读步骤：相邻事件段从后一事件指向前一事件，含义为通行耗时下界。"""
+    # Edge(b -> a, -d)：b 是段的后一事件、a 是前一事件；bound 为最短通行分钟
+    return {
+        "from": names[e.u],
+        "to": names[e.v],
+        "weight": e.w,
+        "line": None,  # 通行约束不来自区间文本，行号显式置空
+        "kind": "travel",
+        "kind_label": "通行下界",
+        "bound": e.bound,
+        "source": "travel",
+        "relation": f"{names[e.u]}−{names[e.v]} ≥ {e.bound}（{names[e.v]}→{names[e.u]} 最短通行）",
+        "segment_index": e.label,  # 事件段序号（1 起）放在 label 字段随边传递
+    }
+
+
+def _itinerary_step_builder(segments_by_index: dict[int, dict]):
+    """构造同时认识区间/锚点边与通行下界边的矛盾链步骤构建器。"""
+    def build(names: list[str], e: Edge) -> dict:
+        if e.kind == "travel":
+            step = _travel_step(names, e)
+            seg = segments_by_index.get(int(e.label))
+            if seg is not None:
+                step["segment"] = seg["index"]
+                step["from_event"] = seg["from_event"]
+                step["to_event"] = seg["to_event"]
+                step["from_place"] = seg["from_place"]
+                step["to_place"] = seg["to_place"]
+                step["route"] = seg["route"]
+                step["travel_minutes"] = seg["travel_minutes"]
+            return step
+        return _edge_step(names, e)
+    return build
+
+
+def check_itinerary(text: str, places_text: str, routes_text: str, itinerary_text: str) -> dict:
+    """行程可达性核对：时间差区间 × 地点网络最短通行，判断整段行程是否可行。
+
+    输入：
+    - text：现有“事件甲,事件乙,最少分钟,最多分钟”区间文本（可留空，表示只核对通行）；
+    - places_text：逐行“事件,地点”；
+    - routes_text：逐行有向“起点,终点,分钟”（非负分钟，重复路段取最短）；
+    - itinerary_text：按发生顺序排列的事件名（每行一个，互不相同）。
+
+    对每对相邻行程事件求地点网络中的最短通行时间（同地点按零分钟），把每个
+    “后一事件 − 前一事件 ≥ 最短通行分钟”作为通行下界与原区间联立（同一套差分约束
+    Bellman-Ford）。无路可达时指出对应事件段；联立出现负环时给出含原区间行号、
+    事件段及其最短路线的矛盾依据；可行时列出各段最短路线、所需分钟和一条满足全部
+    约束的时间线。
+    """
+    # 1) 四类文本各自逐行校验（区间文本允许留空）
+    errors: list[dict] = []
+    rows: list[Row] = []
+    if text and text.strip():
+        rows, errors = parse_text(text)
+    places, place_errors = parse_places(places_text)
+    # 路段文本允许留空（只有一个事件、或相邻事件都在同地点时无需任何路段）
+    routes: list[RouteRow] = []
+    route_errors: list[dict] = []
+    if routes_text and routes_text.strip():
+        routes, route_errors = parse_routes(routes_text)
+    itinerary, itinerary_errors = parse_itinerary(itinerary_text)
+    errors = errors + place_errors + route_errors + itinerary_errors
+
+    place_of = {p.event: p.place for p in places}
+
+    # 2) 行程中的每个事件都必须有地点（区间文本里出现但不在行程中的事件不要求地点）。
+    # 与上面的语法/字段错误一并返回，便于用户一次看到全部待修项；地点文本本身非法时
+    # 仍尽量基于已成功解析的地点行做缺失检查。
+    missing: list[dict] = []
+    for idx, name in enumerate(itinerary, start=1):
+        if name not in place_of:
+            missing.append({
+                "segment_position": idx,
+                "event": name,
+                "message": f"行程第 {idx} 个事件“{name}”缺少事件地点：请在“事件,地点”文本中登记其地点。",
+            })
+    if missing:
+        errors.extend({"line": None, "message": m["message"]} for m in missing)
+    if errors:
+        result = {"status": "error", "errors": errors}
+        if missing:
+            result["missing_places"] = missing
+        return result
+
+    # 3) 逐相邻事件求地点网络最短通行；同地点零分钟，无路可达单独记录
+    segments: list[dict] = []
+    unreachable: list[dict] = []
+    for i in range(len(itinerary) - 1):
+        a, b = itinerary[i], itinerary[i + 1]
+        pa, pb = place_of[a], place_of[b]
+        idx = i + 1
+        if pa == pb:
+            shortest, route = 0, []
+            same_place = True
+        else:
+            shortest, route = _route_between(routes, pa, pb)
+            same_place = False
+        seg = {
+            "index": idx,
+            "from_event": a,
+            "to_event": b,
+            "from_place": pa,
+            "to_place": pb,
+            "same_place": same_place,
+            "reachable": shortest is not None,
+            "travel_minutes": shortest,
+            "route": route,
+        }
+        segments.append(seg)
+        if shortest is None:
+            unreachable.append(seg)
+
+    counts = {
+        "event_count": len({r.a for r in rows} | {r.b for r in rows} | set(itinerary)),
+        "place_count": len({p.place for p in places}),
+        "place_line_count": len(places),
+        "route_count": len(routes),
+        "line_count": len(rows),
+        "itinerary_count": len(itinerary),
+        "segment_count": len(segments),
+    }
+
+    if unreachable:
+        # 无路可达：明确指出对应事件段（不做联立，也不产生“可行/冲突”结论）
+        return {
+            "status": "unreachable",
+            "message": (
+                f"行程共 {len(segments)} 个相邻事件段，其中 {len(unreachable)} 段在地点通行网络中"
+                "无路可达（有向路段按起点→终点单向通行）；已逐段列出，请补充路段或核对地点名称。"
+            ),
+            "itinerary": itinerary,
+            "segments": segments,
+            "unreachable_segments": [s["index"] for s in unreachable],
+            "unreachable_count": len(unreachable),
+            **counts,
+        }
+
+    # 4) 原区间先独立联立：区间自身矛盾时直接返回现有矛盾链（与通行无关，不混入通行边）
+    if rows:
+        interval_system = solve_rows(rows)
+        if interval_system["status"] != "ok":
+            return {
+                "status": "interval_conflict",
+                "message": "上方时间差区间自身已互相矛盾（尚未加入通行下界），先返回现有闭合矛盾链；请先消除区间冲突，再核对行程可达性。",
+                "conflict": interval_system["conflict"],
+                "itinerary": itinerary,
+                "segments": segments,
+                **counts,
+            }
+
+    # 5) 通行下界与原区间联立：每段加边 b -> a，权 -d（即 t(b) − t(a) ≥ d）
+    names, index, edges = _build_graph(rows)
+    for name in itinerary:
+        if name not in index:
+            index[name] = len(names)
+            names.append(name)
+    segments_by_index: dict[int, dict] = {}
+    for seg in segments:
+        ia, ib = index[seg["from_event"]], index[seg["to_event"]]
+        d = seg["travel_minutes"]
+        # label 复用为事件段序号（字符串），矛盾链还原时据此附带事件段与最短路线
+        edges.append(Edge(ib, ia, -d, -1, "travel", d, "travel", str(seg["index"])))
+        segments_by_index[seg["index"]] = seg
+
+    dist, pred, last_relaxed = _relax_all(names, edges)
+    if last_relaxed is not None:
+        result = _conflict_result(
+            names, pred, last_relaxed, len(names),
+            step_builder=_itinerary_step_builder(segments_by_index),
+        )
+        travel_steps = [s for s in result["conflict"]["steps"] if s["kind"] == "travel"]
+        return {
+            "status": "conflict",
+            "message": (
+                "把各相邻事件段的最短通行时间作为下界与原区间联立后出现闭合矛盾链："
+                "链中含原始区间行与通行下界（标注对应事件段及其最短路线），即按发生顺序"
+                "走完该行程所需的通行时间与某些时间差区间互不相容。"
+            ),
+            "conflict": result["conflict"],
+            "travel_step_segments": [s["segment"] for s in travel_steps],
+            "itinerary": itinerary,
+            "segments": segments,
+            **counts,
+        }
+
+    # 6) 可行：平移使最早事件为第 0 分钟，给出一条满足全部区间与通行下界的时间线
+    base = min(dist)
+    minutes = {names[i]: dist[i] - base for i in range(len(names))}
+    timeline = [{"event": n, "minute": minutes[n], "place": place_of.get(n)} for n in names]
+    timeline.sort(key=lambda x: (x["minute"], x["event"]))
+
+    # 行程视角：按发生顺序的时刻、各段实际间隔（≥ 最短通行）与是否落在原区间内
+    ordered = [
+        {"position": i + 1, "event": name, "place": place_of[name], "minute": minutes[name]}
+        for i, name in enumerate(itinerary)
+    ]
+    row_pairs: dict[tuple[str, str], list[Row]] = {}
+    for r in rows:
+        row_pairs.setdefault((r.a, r.b), []).append(r)
+
+    segment_checks: list[dict] = []
+    for seg in segments:
+        actual = minutes[seg["to_event"]] - minutes[seg["from_event"]]
+        direct = row_pairs.get((seg["from_event"], seg["to_event"]), [])
+        covering = [
+            {
+                "line": r.line,
+                "a": r.a,
+                "b": r.b,
+                "low": r.low,
+                "high": r.high,
+                "satisfied": r.low <= actual <= r.high,
+            }
+            for r in direct
+        ]
+        segment_checks.append({
+            **seg,
+            "actual_minutes": actual,
+            "slack_minutes": actual - seg["travel_minutes"],
+            "interval_lines": covering,
+        })
+
+    # 逐条区间核对（与 /api/solve 同口径，时间线为联立通行下界后的可行解）
+    differences = [
+        {
+            "line": r.line,
+            "a": r.a,
+            "b": r.b,
+            "low": r.low,
+            "high": r.high,
+            "actual": dist[index[r.b]] - dist[index[r.a]],
+        }
+        for r in rows
+    ]
+
+    return {
+        "status": "ok",
+        "message": (
+            f"行程共 {len(itinerary)} 个事件、{len(segments)} 个相邻事件段：各段最短通行时间作为下界"
+            "与原区间联立无矛盾，以下时间线满足全部时间差区间与通行下界（最早事件为第 0 分钟）。"
+        ),
+        "itinerary": itinerary,
+        "segments": segment_checks,
+        "timeline": timeline,
+        "ordered_itinerary": ordered,
+        "differences": differences,
+        **counts,
     }

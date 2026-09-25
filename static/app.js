@@ -88,6 +88,38 @@ const EXAMPLE_ALIAS_CONFLICT_TEXT = [
 ].join("\n");
 const EXAMPLE_ALIAS_CONFLICT_ALIASES = "洗漱,盥洗";
 
+// 行程可达性核对——可行示例：与页面可行示例同一组事件，区间给出的时间差足够覆盖
+// 家→餐馆(15)、餐馆→公司(25) 的最短通行；另有一条较慢的直达“家→公司 60”，
+// 多跳 15+25=40 更短。时间线同时满足全部区间与通行下界。
+const EXAMPLE_ITINERARY_OK_TEXT = [
+  "起床,早饭,20,120",
+  "早饭,开会,30,120",
+  "起床,开会,60,300",
+].join("\n");
+const EXAMPLE_ITINERARY_OK_PLACES = [
+  "起床,家",
+  "早饭,餐馆",
+  "开会,公司",
+].join("\n");
+const EXAMPLE_ITINERARY_OK_ROUTES = [
+  "家,餐馆,15",
+  "餐馆,公司,25",
+  "家,公司,60",
+].join("\n");
+const EXAMPLE_ITINERARY_OK_ORDER = ["起床", "早饭", "开会"].join("\n");
+
+// 行程可达性核对——时间冲突示例：两段最短通行合计至少 40 分钟，
+// 但第 3 行要求开会比起床最多晚 30 分钟 ⇒ 通行下界与原区间联立形成负环。
+const EXAMPLE_ITINERARY_CONFLICT_TEXT = [
+  "起床,早饭,10,60",
+  "早饭,开会,10,60",
+  "起床,开会,0,30",
+].join("\n");
+
+// 行程可达性核对——无路可达示例：有向路网只有 家→餐馆，餐馆→公司 无任何有向路径，
+// 第 2 个事件段“早饭 → 开会”被标为无路可达。
+const EXAMPLE_ITINERARY_UNREACH_ROUTES = "家,餐馆,15";
+
 const $ = (id) => document.getElementById(id);
 const resultEl = $("result");
 const redundancyEl = $("redundancy-result");
@@ -106,6 +138,10 @@ const precBEl = $("prec-b");
 const withdrawEl = $("withdraw-result");
 const aliasInputEl = $("alias-input");
 const aliasEl = $("alias-result");
+const itineraryPlacesEl = $("itinerary-places");
+const itineraryRoutesEl = $("itinerary-routes");
+const itineraryOrderEl = $("itinerary-order");
+const itineraryEl = $("itinerary-result");
 
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -682,6 +718,7 @@ $("btn-clear").addEventListener("click", () => {
   precEl.innerHTML = "";
   withdrawEl.innerHTML = "";
   aliasEl.innerHTML = "";
+  itineraryEl.innerHTML = "";
   refreshLineOptions();
   inputEl.focus();
 });
@@ -694,6 +731,7 @@ inputEl.addEventListener("input", () => {
   precEl.innerHTML = "";        // 共同约束已变，旧的先后查询结论作废
   withdrawEl.innerHTML = "";    // 文本已变，旧的最少撤回结论作废
   aliasEl.innerHTML = "";       // 区间已变，旧的别名归并结论作废
+  itineraryEl.innerHTML = "";   // 区间已变，旧的行程可达性结论作废
 });
 refreshLineOptions();
 
@@ -1334,4 +1372,347 @@ $("btn-alias-clear").addEventListener("click", () => {
 });
 aliasInputEl.addEventListener("input", () => {
   aliasEl.innerHTML = "";  // 别名已变，旧的归并结论作废
+});
+
+// ---------- 行程可达性核对 ----------
+
+// 一段最短路线的链图：地点节点 →（路段行号·分钟）→ 地点节点；同地点显示零分钟
+function routeChainHtml(seg) {
+  if (seg.same_place) {
+    return `<span class="seg-sameplace">同地点（${esc(seg.from_place)}），按零分钟处理，不经过任何路段。</span>`;
+  }
+  if (!seg.reachable) {
+    return `<span class="seg-unreachable">无路可达：地点网络中不存在从 “${esc(seg.from_place)}” 到 “${esc(seg.to_place)}” 的有向路径。</span>`;
+  }
+  const nodes = [seg.from_place, ...seg.route.map((r) => r.to)];
+  const parts = [];
+  seg.route.forEach((r, i) => {
+    parts.push(`<span class="route-node">${esc(nodes[i])}</span>`);
+    parts.push(`<span class="route-edge">→<span class="route-meta"> 路段第 ${r.line} 行 · ${r.minutes} 分钟</span></span>`);
+  });
+  parts.push(`<span class="route-node">${esc(nodes[nodes.length - 1])}</span>`);
+  return `<div class="route-chain">${parts.join("")}
+    <span class="route-meta">（合计 <strong>${seg.travel_minutes}</strong> 分钟，途经 ${seg.route.length} 条路段）</span></div>`;
+}
+
+// 各事件段总览表（可行/无路可达/冲突共用）：段号、事件对、地点对、同地点/可达、最短分钟、路线
+function itinerarySegmentsTableHtml(segments, { withActual = false } = {}) {
+  const rows = segments.map((s) => {
+    let status;
+    if (s.same_place) status = '<span class="tag exact">同地点 · 0 分钟</span>';
+    else if (s.reachable) status = '<span class="tag range">可达</span>';
+    else status = '<span class="tag unlocated seg-unreachable">无路可达</span>';
+    const minutes = s.reachable ? s.travel_minutes : "—";
+    const actualCell = withActual
+      ? `<td class="num">${s.actual_minutes}</td><td class="num">+${s.slack_minutes}</td>`
+      : "";
+    return `<tr${s.reachable ? "" : ' class="combo-conflict"'}>
+      <td class="num">第 ${s.index} 段</td>
+      <td>${esc(s.from_event)} → ${esc(s.to_event)}</td>
+      <td>${esc(s.from_place)} → ${esc(s.to_place)}</td>
+      <td>${status}</td>
+      <td class="num">${minutes}</td>
+      ${actualCell}
+    </tr>`;
+  }).join("");
+  const actualHead = withActual
+    ? '<th class="num">时间线实际间隔</th><th class="num">较最短通行富余</th>'
+    : "";
+  return `
+    <table>
+      <thead><tr>
+        <th class="num">事件段</th><th>事件（按发生顺序）</th><th>地点对</th>
+        <th>可达性</th><th class="num">最短通行分钟</th>${actualHead}
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// 可行时间线表（含地点；全部参与联立的事件，按分钟排序）
+function itineraryTimelineTableHtml(timeline) {
+  const rows = timeline.map((t) =>
+    `<tr><td>${esc(t.event)}</td><td>${esc(t.place === null || t.place === undefined ? "—" : t.place)}</td>
+     <td class="num">${t.minute}</td></tr>`).join("");
+  return `
+    <table>
+      <thead><tr><th>事件</th><th>地点</th><th class="num">分钟（最早事件 = 0）</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+// 逐段路线卡片（每段独立展示最短路线与逐路段明细）
+function itineraryRouteCardsHtml(segments) {
+  return segments.map((s) => {
+    const title = `第 ${s.index} 段：${s.from_event}（${s.from_place}）→ ${s.to_event}（${s.to_place}）`;
+    if (!s.reachable && !s.same_place) {
+      return `<div class="card"><h3>${esc(title)}</h3>${routeChainHtml(s)}</div>`;
+    }
+    const detailRows = s.same_place ? "" : s.route.map((r) => `
+      <tr>
+        <td class="num">路段第 ${r.line} 行</td>
+        <td>${esc(r.from)} → ${esc(r.to)}</td>
+        <td class="num">${r.minutes}</td>
+      </tr>`).join("");
+    const detailTable = s.same_place ? "" : `
+      <table>
+        <thead><tr><th class="num">路段行号</th><th>方向</th><th class="num">分钟</th></tr></thead>
+        <tbody>${detailRows}</tbody>
+      </table>`;
+    const actual = s.actual_minutes !== undefined
+      ? `<p class="muted">本时间线中该段实际间隔 <strong>${s.actual_minutes}</strong> 分钟，
+         较最短通行富余 <strong>${s.slack_minutes}</strong> 分钟（通行下界已满足）。</p>`
+      : "";
+    return `<div class="card">
+      <h3>${esc(title)}</h3>
+      ${routeChainHtml(s)}
+      ${actual}
+      ${detailTable}
+    </div>`;
+  }).join("");
+}
+
+// 通行下界步骤的标签渲染（矛盾链 tag）：复用 tag.travel 配色
+function itineraryStepTagHtml(s) {
+  if (s.kind === "travel") {
+    return `<span class="tag travel">事件段 ${s.segment} · 通行下界 ${s.bound}</span>`;
+  }
+  return `<span class="tag ${s.kind}">${stepLineRef(s)} · ${esc(s.kind_label)} ${esc(stepBoundText(s))}</span>`;
+}
+
+// 行程矛盾链：在通用矛盾链图基础上，通行下界环节补充事件段地点对与最短路线
+function itineraryConflictChainHtml(c) {
+  const steps = c.steps;
+  const parts = [];
+  steps.forEach((s, i) => {
+    if (i === 0) parts.push(`<div class="chain-node">${esc(s.from)}</div>`);
+    let extra = "";
+    if (s.kind === "travel") {
+      const segTitle = `事件段 ${s.segment}：${esc(s.from_event)}（${esc(s.from_place)}）→ ${esc(s.to_event)}（${esc(s.to_place)}）`;
+      const routeDesc = s.route.length
+        ? s.route.map((r) => `${esc(r.from)}→${esc(r.to)}(${r.minutes}分,路段第${r.line}行)`).join("，")
+        : "同地点零分钟";
+      extra = `<span class="route-meta">${segTitle}；最短路线：${routeDesc}，合计 ${s.travel_minutes} 分钟</span>`;
+    }
+    parts.push(`
+      <div class="chain-edge">
+        ${itineraryStepTagHtml(s)}
+        <span class="rel">${esc(s.relation)}</span>
+        ${extra}
+        <span class="chain-arrow">→</span>
+      </div>
+      <div class="chain-node">${esc(s.to)}</div>`);
+  });
+  parts.push(`
+    <div class="chain-edge"><span class="muted">闭合回到</span><span class="chain-arrow">⟲</span></div>
+    <div class="chain-node">${esc(c.closes_to)}</div>`);
+  return `<div class="chain">${parts.join("")}</div>`;
+}
+
+function renderItineraryOk(data) {
+  const segRows = data.segments.map((s) => {
+    const lines = (s.interval_lines || []).map((ln) => {
+      const ok = ln.satisfied ? '<span class="ok-text">满足</span>' : '<span style="color:var(--err)">不满足</span>';
+      return `<div>第 ${ln.line} 行 [${ln.low}, ${ln.high}]（${esc(ln.a)}→${esc(ln.b)}）：${ok}</div>`;
+    }).join("");
+    const placePair = s.same_place
+      ? `<span class="seg-sameplace">同地点 · 0 分</span>`
+      : `${esc(s.from_place)} → ${esc(s.to_place)}`;
+    return `<tr>
+      <td class="num">第 ${s.index} 段</td>
+      <td>${esc(s.from_event)} → ${esc(s.to_event)}</td>
+      <td>${placePair}</td>
+      <td class="num">${s.travel_minutes}</td>
+      <td class="num">${s.actual_minutes}</td>
+      <td class="num">+${s.slack_minutes}</td>
+      <td>${lines || '<span class="muted">无直接对应区间行</span>'}</td>
+    </tr>`;
+  }).join("");
+
+  const maxMinute = Math.max(...data.timeline.map((t) => t.minute));
+  const points = data.ordered_itinerary.map((o) => `
+    <div class="tl-point">
+      <div class="tl-dot"></div>
+      <div class="tl-name">${esc(o.event)}</div>
+      <div class="tl-time">第 ${o.minute} 分钟 · ${esc(o.place)}</div>
+    </div>`).join("");
+
+  itineraryEl.innerHTML = `
+    <div class="banner ok">
+      <h2>✓ 行程可达：时间差区间与通行下界全部相容</h2>
+      <p>${esc(data.message)}</p>
+    </div>
+    <div class="card">
+      <h3>按发生顺序的可行时间线</h3>
+      <div class="timeline-track">
+        <div class="tl-line"></div>
+        <div class="tl-grid">${points}</div>
+      </div>
+      ${itineraryTimelineTableHtml(data.timeline)}
+      <p class="muted">时间跨度 0 ~ ${maxMinute} 分钟；所有事件可整体平移，时间差与通行下界不变。</p>
+    </div>
+    <div class="card">
+      <h3>各事件段：最短通行 vs 时间线间隔</h3>
+      <table>
+        <thead><tr>
+          <th class="num">事件段</th><th>事件对</th><th>地点对</th>
+          <th class="num">最短通行</th><th class="num">实际间隔</th><th class="num">富余</th>
+          <th>覆盖该段的原区间行</th>
+        </tr></thead>
+        <tbody>${segRows}</tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>各事件段总览</h3>
+      ${itinerarySegmentsTableHtml(data.segments, { withActual: true })}
+    </div>
+    <h3 style="margin:18px 0 8px">各段最短路线（含逐路段明细）</h3>
+    ${itineraryRouteCardsHtml(data.segments)}`;
+}
+
+function renderItineraryUnreachable(data) {
+  itineraryEl.innerHTML = `
+    <div class="banner err">
+      <h2>✗ 存在无路可达的事件段</h2>
+      <p>${esc(data.message)}</p>
+      <p style="margin-top:6px">无路可达的是：<strong>${data.unreachable_segments.map((i) => `第 ${i} 段`).join("、")}</strong>。
+      通行路段为<strong>有向</strong>（只有“起点→终点”单向），请补充对应方向的路段，或核对地点名称是否一致；
+      在全部相邻事件段可达之前，不进行时间冲突联立。</p>
+    </div>
+    <div class="card">
+      <h3>各事件段可达性总览</h3>
+      ${itinerarySegmentsTableHtml(data.segments)}
+    </div>
+    ${itineraryRouteCardsHtml(data.segments)}`;
+}
+
+function renderItineraryConflict(data) {
+  const c = data.conflict;
+  const segBadges = (data.travel_step_segments || []).map((i) => `第 ${i} 段`).join("、");
+  const detailRows = c.steps.map((s) => {
+    let ref;
+    let extra = "";
+    if (s.kind === "travel") {
+      ref = `事件段 ${s.segment}`;
+      const routeDesc = s.route.length
+        ? s.route.map((r) => `${esc(r.from)}→${esc(r.to)}（${r.minutes}分·路段第${r.line}行）`).join("，")
+        : "同地点零分钟";
+      extra = `<td class="muted">${esc(s.from_event)}（${esc(s.from_place)}）→ ${esc(s.to_event)}（${esc(s.to_place)}）；最短路线：${routeDesc}，合计 ${s.travel_minutes} 分钟</td>`;
+    } else {
+      ref = stepLineRef(s);
+      extra = `<td class="muted">${esc(s.relation)}</td>`;
+    }
+    return `<tr>
+      <td class="num">${ref}</td>
+      <td>${esc(s.from)} → ${esc(s.to)}</td>
+      <td><span class="tag ${s.kind}">${esc(s.kind_label)}</span></td>
+      <td class="num">${esc(stepBoundText(s))}</td>
+      ${extra}
+    </tr>`;
+  }).join("");
+
+  itineraryEl.innerHTML = `
+    <div class="banner conflict">
+      <h2>✗ 行程时间冲突（通行下界 × 原区间）</h2>
+      <p>${esc(data.message)}</p>
+      <p style="margin-top:6px">矛盾链中的通行下界来自事件段：<strong>${esc(segBadges || "（无）")}</strong>；
+      环上界值相加为 <strong>${c.weight_sum} &lt; 0</strong>，意味着“走完这段路所需时间”与某些区间叙述无法同时成立。</p>
+    </div>
+    <div class="card">
+      <h3>闭合矛盾链（含原区间行号、事件段与最短路线）</h3>
+      ${itineraryConflictChainHtml(c)}
+    </div>
+    <div class="card">
+      <h3>矛盾依据明细</h3>
+      <table>
+        <thead><tr>
+          <th class="num">来源（区间行 / 事件段）</th><th>图中方向</th><th>使用的界</th>
+          <th class="num">界值（分钟）</th><th>含义 / 事件段最短路线</th>
+        </tr></thead>
+        <tbody>${detailRows}</tbody>
+      </table>
+      <p class="muted">“通行下界”取该事件段在地点网络中的最短通行分钟（同地点为 0）；“上界/下界”取自上方
+      时间差区间文本的原始行号。各事件段的完整最短路线见下方卡片。</p>
+    </div>
+    <div class="card">
+      <h3>各事件段可达性与最短通行</h3>
+      ${itinerarySegmentsTableHtml(data.segments)}
+    </div>
+    ${itineraryRouteCardsHtml(data.segments)}`;
+}
+
+function renderItineraryIntervalConflict(data) {
+  itineraryEl.innerHTML = `
+    <div class="banner err">
+      <h2>✗ 时间差区间自身矛盾</h2>
+      <p>${esc(data.message)}</p>
+    </div>`;
+  renderConflict({ conflict: data.conflict }, itineraryEl);
+  itineraryEl.insertAdjacentHTML("beforeend", `
+    <div class="card">
+      <h3>各事件段可达性与最短通行（仅供参考，未参与上述联立）</h3>
+      ${itinerarySegmentsTableHtml(data.segments)}
+    </div>
+    ${itineraryRouteCardsHtml(data.segments)}`);
+}
+
+async function checkItinerary() {
+  itineraryEl.innerHTML = `<div class="card muted">求各段最短通行并联立中…</div>`;
+  try {
+    const resp = await fetch("/api/itinerary", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: inputEl.value,
+        places: itineraryPlacesEl.value,
+        routes: itineraryRoutesEl.value,
+        itinerary: itineraryOrderEl.value,
+      }),
+    });
+    const data = await resp.json();
+    if (data.status === "ok") renderItineraryOk(data);
+    else if (data.status === "unreachable") renderItineraryUnreachable(data);
+    else if (data.status === "conflict") renderItineraryConflict(data);
+    else if (data.status === "interval_conflict") renderItineraryIntervalConflict(data);
+    else renderErrors(data.errors || [{ line: null, message: "未知错误。" }], itineraryEl);
+  } catch (err) {
+    itineraryEl.innerHTML = `
+      <div class="banner err"><h2>请求失败</h2><p>${esc(err.message)}</p></div>`;
+  }
+}
+
+$("btn-itinerary").addEventListener("click", checkItinerary);
+$("btn-itinerary-example-ok").addEventListener("click", () => {
+  inputEl.value = EXAMPLE_ITINERARY_OK_TEXT;
+  itineraryPlacesEl.value = EXAMPLE_ITINERARY_OK_PLACES;
+  itineraryRoutesEl.value = EXAMPLE_ITINERARY_OK_ROUTES;
+  itineraryOrderEl.value = EXAMPLE_ITINERARY_OK_ORDER;
+  refreshLineOptions();
+  checkItinerary();
+});
+$("btn-itinerary-example-conflict").addEventListener("click", () => {
+  inputEl.value = EXAMPLE_ITINERARY_CONFLICT_TEXT;
+  itineraryPlacesEl.value = EXAMPLE_ITINERARY_OK_PLACES;
+  itineraryRoutesEl.value = EXAMPLE_ITINERARY_OK_ROUTES;
+  itineraryOrderEl.value = EXAMPLE_ITINERARY_OK_ORDER;
+  refreshLineOptions();
+  checkItinerary();
+});
+$("btn-itinerary-example-unreach").addEventListener("click", () => {
+  inputEl.value = EXAMPLE_ITINERARY_OK_TEXT;
+  itineraryPlacesEl.value = EXAMPLE_ITINERARY_OK_PLACES;
+  itineraryRoutesEl.value = EXAMPLE_ITINERARY_UNREACH_ROUTES;
+  itineraryOrderEl.value = EXAMPLE_ITINERARY_OK_ORDER;
+  refreshLineOptions();
+  checkItinerary();
+});
+$("btn-itinerary-clear").addEventListener("click", () => {
+  itineraryPlacesEl.value = "";
+  itineraryRoutesEl.value = "";
+  itineraryOrderEl.value = "";
+  itineraryEl.innerHTML = "";
+  itineraryPlacesEl.focus();
+});
+// 地点 / 路段 / 行程顺序任一变化，旧的行程结论立即作废
+[itineraryPlacesEl, itineraryRoutesEl, itineraryOrderEl].forEach((el) => {
+  el.addEventListener("input", () => { itineraryEl.innerHTML = ""; });
 });

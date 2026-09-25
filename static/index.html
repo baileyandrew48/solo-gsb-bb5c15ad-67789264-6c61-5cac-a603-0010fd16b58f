@@ -29,6 +29,11 @@
         同一事件被记成多个名字时，还可在区间旁逐行填写<strong>事件别名</strong>（<code>事件名,同一事件的另一名称</code>）做<strong>别名归并核对</strong>：
         后端按传递关系把名称归为同一事件，再用归并后的节点联立原区间（<strong>同组内的区间也参与判定</strong>）；
         归并造成矛盾时给出保留<strong>原始区间行号与别名组</strong>的冲突说明，可解时展示按统一事件归并的时间线及每组原名称。
+        若还要核对“按所述顺序能不能赶得及”，可逐行填写<strong>事件地点</strong>（<code>事件,地点</code>）、
+        有向<strong>通行路段</strong>（<code>起点,终点,分钟</code>）与按发生顺序排列的<strong>行程事件</strong>做<strong>行程可达性核对</strong>：
+        后端对每对相邻事件求地点网络<strong>最短通行时间</strong>（同地点零分钟），把通行下界与本页时间差区间联立；
+        无路可达时指出对应事件段，时间冲突时给出含<strong>原区间行号、事件段及其最短路线</strong>的矛盾依据，
+        可行时列出各段最短路线、所需分钟与一条满足全部约束的时间线。
       </p>
     </header>
 
@@ -64,6 +69,46 @@
     </section>
 
     <section id="alias-result" aria-live="polite"></section>
+
+    <section class="input-area">
+      <label><strong>行程可达性核对</strong></label>
+      <p class="muted" style="margin-top:0">
+        继续使用上方“事件区间”文本中的<strong>时间差区间</strong>（可留空，表示只核对通行顺序）。
+        另逐行填写<strong>事件地点</strong> <code>事件,地点</code>、有向<strong>通行路段</strong>
+        <code>起点,终点,分钟</code>（单向通行、非负分钟，同一起终点多行取最短），并在
+        <strong>行程顺序</strong>框中<strong>按发生顺序每行一个事件名</strong>（互不相同）。
+        后端对每对相邻事件求地点网络中的<strong>最短通行时间</strong>（<strong>同地点按零分钟</strong>），
+        把“后一事件 − 前一事件 ≥ 最短通行”作为下界与原区间联立：<strong>无路可达</strong>时指出对应事件段；
+        <strong>时间冲突</strong>时给出含原区间行号、事件段及其最短路线的矛盾依据；<strong>可行</strong>时列出
+        各段最短路线、所需分钟与一条满足全部约束的时间线。
+      </p>
+      <div class="itinerary-grid">
+        <div>
+          <label for="itinerary-places">事件地点（每行 <code>事件,地点</code>）</label>
+          <textarea id="itinerary-places" class="itinerary-input" rows="7" spellcheck="false"
+            placeholder="起床,家&#10;早饭,餐馆&#10;开会,公司"></textarea>
+        </div>
+        <div>
+          <label for="itinerary-routes">通行路段（每行 <code>起点,终点,分钟</code>，有向）</label>
+          <textarea id="itinerary-routes" class="itinerary-input" rows="7" spellcheck="false"
+            placeholder="家,餐馆,15&#10;餐馆,公司,25&#10;家,公司,60"></textarea>
+        </div>
+        <div>
+          <label for="itinerary-order">行程顺序（每行一个事件，按发生先后）</label>
+          <textarea id="itinerary-order" class="itinerary-input" rows="7" spellcheck="false"
+            placeholder="起床&#10;早饭&#10;开会"></textarea>
+        </div>
+      </div>
+      <div class="button-row">
+        <button id="btn-itinerary" class="primary">行程可达性核对</button>
+        <button id="btn-itinerary-example-ok">填入可行行程示例</button>
+        <button id="btn-itinerary-example-conflict">填入时间冲突示例</button>
+        <button id="btn-itinerary-example-unreach">填入无路可达示例</button>
+        <button id="btn-itinerary-clear" class="ghost">清空行程</button>
+      </div>
+    </section>
+
+    <section id="itinerary-result" aria-live="polite"></section>
 
     <section class="input-area">
       <label for="anchor-input"><strong>绝对时间锚点（每行一条）</strong></label>
